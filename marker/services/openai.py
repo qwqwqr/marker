@@ -58,13 +58,13 @@ class OpenAIService(BaseService):
         ]
 
     def __call__(
-        self,
-        prompt: str,
-        image: PIL.Image.Image | List[PIL.Image.Image] | None,
-        block: Block | None,
-        response_schema: type[BaseModel],
-        max_retries: int | None = None,
-        timeout: int | None = None,
+            self,
+            prompt: str,
+            image: PIL.Image.Image | List[PIL.Image.Image] | None,
+            block: Block | None,
+            response_schema: type[BaseModel],
+            max_retries: int | None = None,
+            timeout: int | None = None,
     ):
         if max_retries is None:
             max_retries = self.max_retries
@@ -105,20 +105,52 @@ class OpenAIService(BaseService):
                         llm_tokens_used=total_tokens, llm_request_count=1
                     )
                 return json.loads(response_text)
-            except (APITimeoutError, RateLimitError) as e:
-                # Rate limit exceeded
+            except RateLimitError as e:
                 if tries == total_tries:
-                    # Last attempt failed. Give up
                     logger.error(
                         f"Rate limit error: {e}. Max retries reached. Giving up. (Attempt {tries}/{total_tries})",
                     )
                     break
-                else:
-                    wait_time = tries * self.retry_wait_time
-                    logger.warning(
-                        f"Rate limit error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
+
+                reset_time = None
+                if hasattr(e, 'response') and e.response is not None:
+                    headers = e.response.headers
+                    reset_time = headers.get('x-ratelimit-reset') or headers.get('retry-after')
+
+                if reset_time:
+                    try:
+                        reset_time = int(reset_time)
+                        current_time = time.time()
+
+                        if reset_time > current_time:
+                            sleep_time = reset_time - current_time
+                        else:
+                            sleep_time = reset_time
+
+                        logger.warning(
+                            f"Rate limit hit. Waiting until reset time (sleeping {sleep_time:.1f} seconds)... (Attempt {tries}/{total_tries})",
+                        )
+                        time.sleep(sleep_time)
+                        continue
+                    except (ValueError, TypeError):
+                        pass
+
+                wait_time = tries * self.retry_wait_time
+                logger.warning(
+                    f"Rate limit error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
+                )
+                time.sleep(wait_time)
+            except APITimeoutError as e:
+                if tries == total_tries:
+                    logger.error(
+                        f"Timeout error: {e}. Max retries reached. Giving up. (Attempt {tries}/{total_tries})",
                     )
-                    time.sleep(wait_time)
+                    break
+                wait_time = tries * self.retry_wait_time
+                logger.warning(
+                    f"Timeout error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
+                )
+                time.sleep(wait_time)
             except Exception as e:
                 logger.error(f"OpenAI inference failed: {e}")
                 break
