@@ -124,7 +124,7 @@ class OpenAIService(BaseService):
                         except (ValueError, AttributeError):
                             reset_time = 360
                     else:
-                        reset_time_str = headers.get('x-ratelimit-reset-request') or \
+                        reset_time_str = headers.get('x-ratelimit-reset-requests') or \
                                          headers.get('x-ratelimit-reset') or \
                                          headers.get('retry-after')
                         try:
