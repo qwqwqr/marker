@@ -66,27 +66,20 @@ class OpenAIService(BaseService):
             max_retries: int | None = None,
             timeout: int | None = None,
     ):
-        if max_retries is None:
-            max_retries = self.max_retries
-
         if timeout is None:
             timeout = self.timeout
 
         client = self.get_client()
         image_data = self.format_image_for_llm(image)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    *image_data,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        messages = [{
+            "role": "user",
+            "content": [*image_data, {"type": "text", "text": prompt}],
+        }]
 
-        total_tries = max_retries + 1
-        for tries in range(1, total_tries + 1):
+        tries = 0
+        while True:
+            tries += 1
             try:
                 response = client.beta.chat.completions.parse(
                     extra_headers={
@@ -101,58 +94,72 @@ class OpenAIService(BaseService):
                 response_text = response.choices[0].message.content
                 total_tokens = response.usage.total_tokens
                 if block:
-                    block.update_metadata(
-                        llm_tokens_used=total_tokens, llm_request_count=1
-                    )
+                    block.update_metadata(llm_tokens_used=total_tokens, llm_request_count=1)
                 return json.loads(response_text)
-            except RateLimitError as e:
-                if tries == total_tries:
-                    logger.error(
-                        f"Rate limit error: {e}. Max retries reached. Giving up. (Attempt {tries}/{total_tries})",
-                    )
-                    break
 
+            except RateLimitError as e:
                 reset_time = None
+                is_token_limit = False
+                remaining_tokens = 'unknown'
+                limit_tokens = 'unknown'
+
                 if hasattr(e, 'response') and e.response is not None:
                     headers = e.response.headers
-                    reset_time = headers.get('x-ratelimit-reset') or headers.get('retry-after')
+                    logger.debug(f"RateLimit Headers: {dict(headers)}")
+
+                    remaining_tokens = headers.get('x-ratelimit-remaining-tokens', 'unknown')
+                    limit_tokens = headers.get('x-ratelimit-limit-tokens', 'unknown')
+                    logger.info(f"[{self.openai_model}] Tokens: {remaining_tokens}/{limit_tokens}")
+
+                    if headers.get('x-ratelimit-reset-tokens'):
+                        try:
+                            reset_header = headers['x-ratelimit-reset-tokens']
+                            if 'h' in reset_header:
+                                reset_time = int(reset_header.split('h')[0]) * 3600
+                            elif 'm' in reset_header:
+                                reset_time = int(reset_header.split('m')[0]) * 60
+                            else:
+                                reset_time = int(reset_header.replace('s', ''))
+                            is_token_limit = True
+                        except (ValueError, AttributeError):
+                            reset_time = 360
+                    else:
+                        reset_time_str = headers.get('x-ratelimit-reset-request') or \
+                                         headers.get('x-ratelimit-reset') or \
+                                         headers.get('retry-after')
+                        try:
+                            reset_time = int(float(reset_time_str)) if reset_time_str else None
+                        except (TypeError, ValueError):
+                            reset_time = None
 
                 if reset_time:
                     try:
-                        reset_time = int(reset_time)
-                        current_time = time.time()
-
-                        if reset_time > current_time:
-                            sleep_time = reset_time - current_time
-                        else:
+                        if is_token_limit:
                             sleep_time = reset_time
+                            if remaining_tokens != 'unknown' and int(remaining_tokens) <= 0:
+                                logger.warning(f"Token quota exhausted. Waiting {sleep_time}s...")
+                        else:
+                            current_time = time.time()
+                            sleep_time = max(int(reset_time) - current_time, 1)
 
                         logger.warning(
-                            f"Rate limit hit. Waiting until reset time (sleeping {sleep_time:.1f} seconds)... (Attempt {tries}/{total_tries})",
-                        )
+                            f"Waiting {sleep_time:.1f}s for {'token' if is_token_limit else 'rate'} limit reset...")
                         time.sleep(sleep_time)
                         continue
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError) as ve:
+                        logger.warning(f"Error parsing reset time: {ve}")
 
-                wait_time = tries * self.retry_wait_time
-                logger.warning(
-                    f"Rate limit error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
-                )
+                wait_time = min(tries * self.retry_wait_time, 360)
+                logger.warning(f"Retrying in {wait_time}s... (Attempt {tries})")
                 time.sleep(wait_time)
+
             except APITimeoutError as e:
-                if tries == total_tries:
-                    logger.error(
-                        f"Timeout error: {e}. Max retries reached. Giving up. (Attempt {tries}/{total_tries})",
-                    )
-                    break
-                wait_time = tries * self.retry_wait_time
-                logger.warning(
-                    f"Timeout error: {e}. Retrying in {wait_time} seconds... (Attempt {tries}/{total_tries})",
-                )
+                wait_time = min(tries * self.retry_wait_time, 360)
+                logger.warning(f"Timeout error: {e}. Retrying in {wait_time}s... (Attempt {tries})")
                 time.sleep(wait_time)
+
             except Exception as e:
-                logger.error(f"OpenAI inference failed: {e}")
+                logger.error(f"Fatal error: {e}. Aborting after {tries} attempts.")
                 break
 
         return {}
